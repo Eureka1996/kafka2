@@ -1860,7 +1860,7 @@ class UnifiedLog(@volatile var logStartOffset: Long,
   }
 }
 
-object UnifiedLog extends Logging {
+object l extends Logging {
   val LogFileSuffix = LogFileUtils.LOG_FILE_SUFFIX
 
   val IndexFileSuffix = LogFileUtils.INDEX_FILE_SUFFIX

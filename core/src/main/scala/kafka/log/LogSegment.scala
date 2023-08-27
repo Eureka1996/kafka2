@@ -46,13 +46,26 @@ import scala.math._
  * A segment with a base offset of [base_offset] would be stored in two files, a [base_offset].index and a [base_offset].log file.
  *
  * @param log The file records containing log entries
+ *            实际保存Kafka消息的对象
  * @param lazyOffsetIndex The offset index
+ *                        位移索引文件
  * @param lazyTimeIndex The timestamp index
+ *                      时间戳索引文件
  * @param txnIndex The transaction index
+ *                 已中止事务索引文件
  * @param baseOffset A lower bound on the offsets in this segment
+ *                   每个日志段对象保存自己的起始位移baseOffset。
+ *                   磁盘上看到的文件名就是baseOffset的值。
+ *                   每个LogSegment对象实例一旦被创建，它的起始位移就是固定的，不能再被更改。
  * @param indexIntervalBytes The approximate number of bytes between entries in the index
+ *                           对应Broker端参数log.index.interval.bytes值，它控制了日志段对象新增索引项的频率。
+ *                           默认情况下，日志段至少新写入4KB的消息数据才会新增一条索引项。
  * @param rollJitterMs The maximum random jitter subtracted from the scheduled segment roll time
+ *                     日志段对象新增倒计时的扰动值。
+ *                     目前Borker端日志段新增倒计时是全局设置，在未来 的某个时刻可能同时创建多个日志段对象，这将极大地增加物理磁盘I/O压力。
+ *                     有了rollJitterMs值的干扰，每个新增日志段在创建 时会彼此岔开一小段时间，这样可以缓解物理磁盘的 I/O 负载瓶颈。
  * @param time The time instance
+ *             用于统计计时的一个实现类，在Kafka源码中普遍出现。
  */
 @nonthreadsafe
 class LogSegment private[log] (val log: FileRecords,
@@ -137,9 +150,13 @@ class LogSegment private[log] (val log: FileRecords,
    * It is assumed this method is being called from within a lock.
    *
    * @param largestOffset The last offset in the message set
+   *                      最大位移值
    * @param largestTimestamp The largest timestamp in the message set.
+   *                         最大时间戳
    * @param shallowOffsetOfMaxTimestamp The offset of the message that has the largest timestamp in the messages to append.
+   *                                    最大时间戳对应消息的位移
    * @param records The log entries to append.
+   *                真正要写入的消息集合。
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
    */
   @nonthreadsafe
@@ -150,20 +167,29 @@ class LogSegment private[log] (val log: FileRecords,
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
+      // 判断日志段是否为空。
       val physicalPosition = log.sizeInBytes()
+      // 如果日志段为空，需要记录要写入消息集合的最大时间戳，并将其作为后面新增日志段倒计时的依据。
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
 
+      // 确保输入参数最大位移值是合法的。
+      // 那怎么判断是不是合法呢?标准就是看它与日志段起始位移的差值是否在整数范围内，即 largestOffset - baseOffset 的值是不是 介于 [0，Int.MAXVALUE] 之间。
+      // 在极个别的情况下，这个差值可 能会越界，这时， append 方法就会抛出异常，阻止后续的消息写入。
+      // 一旦你碰到这个问 题，你需要做的是升级你的 Kafka 版本，因为这是由已知的 Bug 导致的。
       ensureOffsetInRange(largestOffset)
 
       // append the messages
+      // 它的工作是将内存 中的消息对象写入到操作系统的页缓存。
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
+      // 更新日志段的最大时间戳以及最大时间戳所属消息的位移值属性。每个日志 段都要保存当前最大时间戳信息和所属消息的位移信息。
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampAndOffsetSoFar = new TimestampOffset(largestTimestamp, shallowOffsetOfMaxTimestamp)
       }
       // append an entry to the index (if needed)
+      // 更新索引项和写入的字节数了
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
         offsetIndex.append(largestOffset, physicalPosition)
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
@@ -281,9 +307,15 @@ class LogSegment private[log] (val log: FileRecords,
    * no more than maxSize bytes and will end before maxOffset if a maxOffset is specified.
    *
    * @param startOffset A lower bound on the first offset to include in the message set we read
+   *                    要读取的第一条消息的位移
    * @param maxSize The maximum number of bytes to include in the message set we read
+   *                能读取的最大字节数。
    * @param maxPosition The maximum position in the log segment that should be exposed for read
+   *                    能读到的最大文件位置。
    * @param minOneMessage If this is true, the first message will be returned even if it exceeds `maxSize` (if one exists)
+   *                      是否允许在消息体过大时至少返回第一条消息。
+   *                      当这个参数为 true 时，即使出现消息体 字节数超过了 maxSize 的情形，read 方法依然能返回至少一条消息。
+   *                      引入这个参数主要是 为了确保不出现消费饿死的情况。
    *
    * @return The fetched data and the offset metadata of the first message whose offset is >= startOffset,
    *         or null if the startOffset is larger than the largest offset in this log
@@ -296,6 +328,9 @@ class LogSegment private[log] (val log: FileRecords,
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    // 定位要读取的起始文件位置 (startPosition)。
+    // 输入参 数 startOffset 仅仅是位移值，
+    // Kafka 需要根据索引信息找到对应的物理文件位置才能开始读取消息。
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null
@@ -326,6 +361,8 @@ class LogSegment private[log] (val log: FileRecords,
   /**
    * Run recovery on the given segment. This will rebuild the index from the log file and lop off any invalid bytes
    * from the end of the log and index.
+   * 用于恢复日志段。Broker 在启动时会 从磁盘上加载所有日志段信息到内存中，并创建相应的 LogSegment 对象实例。
+   * 在这个过 程中，它需要执行一系列的操作。
    *
    * @param producerStateManager Producer state corresponding to the segment's base offset. This is needed to recover
    *                             the transaction index.
@@ -335,6 +372,7 @@ class LogSegment private[log] (val log: FileRecords,
    */
   @nonthreadsafe
   def recover(producerStateManager: ProducerStateManager, leaderEpochCache: Option[LeaderEpochFileCache] = None): Int = {
+    // 代码依次调用索引对象的 reset 方法清空所有的索引文件，
     offsetIndex.reset()
     timeIndex.reset()
     txnIndex.reset()
@@ -342,11 +380,17 @@ class LogSegment private[log] (val log: FileRecords,
     var lastIndexEntry = 0
     maxTimestampAndOffsetSoFar = TimestampOffset.UNKNOWN
     try {
+      // 之后会开始遍 历日志段中的所有消息集合或消息批次(RecordBatch)。
       for (batch <- log.batches.asScala) {
+        // 对于读取到的每个消息集合，日志段必须要确保它们是合法的，这主要体现在两个方面:
+        // 1. 该集合中的消息必须要符合 Kafka 定义的二进制格式;
         batch.ensureValid()
+        // 2. 该集合中最后一条消息的位移值不能越界，即它与日志段起始位移的差值必须是一个正 整数值。
         ensureOffsetInRange(batch.lastOffset)
 
         // The max timestamp is exposed at the batch level, so no need to iterate the records
+        // 校验完消息集合之后，代码会更新遍历过程中观测到的最大时间戳以及所属消息的位移值。
+        // 这两个数据用于后续构建索引项。
         if (batch.maxTimestamp > maxTimestampSoFar) {
           maxTimestampAndOffsetSoFar = new TimestampOffset(batch.maxTimestamp, batch.lastOffset)
         }
@@ -357,8 +401,10 @@ class LogSegment private[log] (val log: FileRecords,
           timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
           lastIndexEntry = validBytes
         }
+        // 不断累加当前已读取的消息字节数，并 根据该值有条件地写入索引项。
         validBytes += batch.sizeInBytes()
 
+        // 更新事务型 Producer 的状态以及 Leader Epoch 缓 存。不过，这两个并不是理解 Kafka 日志结构所必需的组件，因此，我们可以忽略它们。
         if (batch.magic >= RecordBatch.MAGIC_VALUE_V2) {
           leaderEpochCache.foreach { cache =>
             if (batch.partitionLeaderEpoch >= 0 && cache.latestEpoch.asScala.forall(batch.partitionLeaderEpoch > _))
@@ -372,6 +418,10 @@ class LogSegment private[log] (val log: FileRecords,
         warn("Found invalid messages in log segment %s at byte offset %d: %s. %s"
           .format(log.file.getAbsolutePath, validBytes, e.getMessage, e.getCause))
     }
+    // 遍历执行完成后，Kafka 会将日志段当前总字节数和刚刚累加的已读取字节数进行比较，
+    // 如果发现前者比后者大，说明日志段写入了一些非法消息，需要执行截断操作，将日志段大小 调整回合法的数值。
+    // 同时， Kafka 还必须相应地调整索引文件的大小。
+    // 把这些都做完之 后，日志段恢复的操作也就宣告结束了。
     val truncated = log.sizeInBytes - validBytes
     if (truncated > 0)
       debug(s"Truncated $truncated invalid bytes at the end of segment ${log.file.getAbsoluteFile} during recovery")
@@ -417,6 +467,7 @@ class LogSegment private[log] (val log: FileRecords,
   /**
    * Truncate off all index and log entries with offsets >= the given offset.
    * If the given offset is larger than the largest message in this segment, do nothing.
+   * 这个方法会将日志段中的数据强制截断到指定的位移处。
    *
    * @param offset The offset to truncate to
    * @return The number of log bytes truncated
